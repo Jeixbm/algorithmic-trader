@@ -1,10 +1,9 @@
-# Archivos de credenciales
+# Credenciales
 .env
 
-# Archivos de datos generados
+# Archivos de datos y modelos
 *.csv
-
-# Archivos de estado y logs
+*.joblib
 state.json
 bot_logs.log
 

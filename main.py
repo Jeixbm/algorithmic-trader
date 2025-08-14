@@ -11,6 +11,7 @@ from risk_manager import RiskManager
 from state_manager import StateManager
 from notifier import notifier
 from execution_handler import execution_handler
+from portfolio_analyzer import portfolio_analyzer
 
 def main():
     log.info("==============================================")
@@ -24,10 +25,11 @@ def main():
 
     # --- Parámetros Óptimos para Solana ---
     strategy_params_sol = {'fast': 20, 'slow': 60, 'rsi_period': 21, 'rsi_threshold': 55}
-    risk_params_sol = {'risk_per_trade': 0.02, 'atr_period': 14, 'atr_multiplier': 3.5}
+    risk_params_sol = {'atr_period': 14, 'atr_multiplier': 3.5}
     
     sol_strategy = Strategy(**strategy_params_sol)
-    risk_manager = RiskManager(risk_per_trade_percentage=risk_params_sol['risk_per_trade'])
+    # --- CAMBIO 1: Inicializamos el RiskManager con un riesgo por defecto ---
+    risk_manager = RiskManager(default_risk_per_trade=0.02)
     state_manager = StateManager()
     total_capital = 10000 
     
@@ -43,59 +45,75 @@ def main():
             order_id = trade['order_details']['id']
             product_id = trade['order_details']['symbol']
             
-            # 1. Verificamos el estado real de la orden en el exchange
             order_status = execution_handler.get_order_status(order_id, product_id)
             
             if order_status and order_status['status'] == 'closed':
                 log.info(f"Orden {order_id} confirmada como EJECUTADA. La posición está activa.")
-                # Aquí iría la lógica para gestionar el trailing stop-loss de la posición activa.
+                # Aquí iría la lógica para gestionar el trailing stop-loss.
                 
             elif order_status and order_status['status'] == 'open':
-                log.info(f"La orden de compra {order_id} todavía está abierta (esperando a ser ejecutada). No se tomarán más acciones.")
-
+                log.info(f"La orden de compra {order_id} todavía está abierta (esperando a ser ejecutada).")
             elif order_status is None:
-                log.warning(f"No se pudo confirmar el estado de la orden {order_id}. Se reintentará en el próximo ciclo.")
+                log.warning(f"No se pudo confirmar el estado de la orden {order_id}. Se reintentará.")
 
         # --- LÓGICA DE BÚSQUEDA DE NUEVAS ENTRADAS ---
         elif 'SOL' not in active_trades:
             log.info("--- Buscando nueva oportunidad de entrada para Solana (SOL) ---")
+            
             sol_data = api_client.get_historical_data(product_id='SOL/USD', granularity='6h', min_candles=201)
             
             if sol_data is not None and not sol_data.empty:
-                sol_data.ta.atr(append=True, length=risk_params_sol['atr_period'])
-                sol_signal = sol_strategy.analyze_sol_combined(sol_data)
-                log.info(f"Señal de la estrategia SOL: {sol_signal}")
-                
-                if sol_signal == 'BUY':
-                    latest_data = sol_data.iloc[-1]
-                    entry_price = latest_data['close']
-                    atr_col_name = f'ATRr_{risk_params_sol["atr_period"]}'
-                    stop_loss_price = entry_price - (latest_data[atr_col_name] * risk_params_sol['atr_multiplier'])
-                    position_size = risk_manager.calculate_position_size(total_capital, entry_price, stop_loss_price)
+                if not portfolio_analyzer.is_highly_correlated('SOL/USD', sol_data, active_trades):
+                    log.info("Correlación de cartera aceptable. Procediendo con el análisis de la señal...")
+                    sol_data.ta.atr(append=True, length=risk_params_sol['atr_period'])
+                    sol_signal = sol_strategy.analyze_sol_combined(sol_data)
+                    log.info(f"Señal de la estrategia SOL: {sol_signal}")
                     
-                    if position_size is not None:
-                        amount_of_asset = position_size / entry_price
-                        # Usar la nueva función para colocar una orden límite un 0.5% por debajo del precio actual
-                        limit_price = entry_price * 0.995
-                        order_result = execution_handler.place_limit_order(
-                            product_id='SOL/USD', 
-                            side='buy', 
-                            price=limit_price, 
-                            amount_of_asset=amount_of_asset
+                    if sol_signal == 'BUY':
+                        latest_data = sol_data.iloc[-1]
+                        
+                        # --- CAMBIO 2: Lógica de Riesgo Dinámico ---
+                        avg_atr_percent = (latest_data['ATRr_14'] / latest_data['close']) * 100
+                        
+                        if avg_atr_percent < 4: # Volatilidad baja -> Alta confianza
+                            risk_for_this_trade = 0.03 # Arriesgar 3%
+                            log.info(f"Volatilidad baja detectada ({avg_atr_percent:.2f}%). Aumentando riesgo a 3%.")
+                        elif avg_atr_percent > 7: # Volatilidad alta -> Baja confianza
+                            risk_for_this_trade = 0.01 # Arriesgar 1%
+                            log.info(f"Volatilidad alta detectada ({avg_atr_percent:.2f}%). Reduciendo riesgo a 1%.")
+                        else: # Volatilidad normal
+                            risk_for_this_trade = risk_manager.default_risk
+                        # --- FIN DE LA LÓGICA DE RIESGO DINÁMICO ---
+                        
+                        entry_price = latest_data['close']
+                        atr_col_name = f'ATRr_{risk_params_sol["atr_period"]}'
+                        stop_loss_price = entry_price - (latest_data[atr_col_name] * risk_params_sol['atr_multiplier'])
+                        
+                        position_size = risk_manager.calculate_position_size(
+                            total_capital, entry_price, stop_loss_price, risk_for_this_trade
                         )
                         
-                        if order_result:
-                            log.info(f"Orden Límite para SOL colocada. ID: {order_result['id']}")
-                            active_trades['SOL'] = { 
-                                "order_details": order_result, 
-                                "stop_loss_price": stop_loss_price,
-                                "status": "open" 
-                            }
-                            state_manager.save_state(active_trades)
+                        if position_size is not None:
+                            amount_of_asset = position_size / entry_price
+                            limit_price = entry_price * 0.995
+                            order_result = execution_handler.place_limit_order(
+                                product_id='SOL/USD', 
+                                side='buy', 
+                                price=limit_price, 
+                                amount_of_asset=amount_of_asset
+                            )
+                            
+                            if order_result:
+                                log.info(f"Orden Límite para SOL colocada. ID: {order_result['id']}")
+                                active_trades['SOL'] = { "order_details": order_result, "stop_loss_price": stop_loss_price, "status": "open" }
+                                state_manager.save_state(active_trades)
+                else:
+                    log.warning("No se pudieron obtener los datos suficientes para SOL o hubo un error en la API.")
 
         # Pausa de 6 horas
         sleep_duration_seconds = 6 * 60 * 60
         log.info(f"Ciclo finalizado. Durmiendo durante {sleep_duration_seconds / 3600:.1f} horas...")
+        log.info("==============================================")
         time.sleep(sleep_duration_seconds)
 
 if __name__ == "__main__":
