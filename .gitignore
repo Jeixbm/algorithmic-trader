@@ -1,0 +1,13 @@
+# Archivos de credenciales
+.env
+
+# Archivos de datos generados
+*.csv
+
+# Archivos de estado y logs
+state.json
+bot_logs.log
+
+# Directorios de Python
+__pycache__/
+venv/
