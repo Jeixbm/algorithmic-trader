@@ -1,89 +1,61 @@
 # trading_bot/api_client.py
-import pandas as pd
+
 import ccxt
-import time
-from config import config
+import pandas as pd
 from logger import log
+from config import config
+import time
 
 class APIClient:
-    """
-    Versión 2.0: Cliente de API robusto con lógica de reintentos.
-    """
-    def __init__(self, max_retries=5, initial_delay=1):
-        """
-        Inicializa el cliente con parámetros para la lógica de reintentos.
-        """
-        self.max_retries = max_retries
-        self.initial_delay = initial_delay
+    def __init__(self):
+        self.exchange = None
         try:
-            self.client = ccxt.coinbase({
+            exchange_class = getattr(ccxt, 'coinbase')
+            self.exchange = exchange_class({
                 'apiKey': config.API_KEY,
                 'secret': config.API_SECRET,
             })
-            log.info("Cliente de API de Coinbase (vía CCXT) inicializado.")
+            log.info(f"Cliente de API de {self.exchange.name} inicializado.")
         except Exception as e:
-            log.critical(f"Error al inicializar el cliente de API CCXT: {e}")
-            self.client = None
+            log.error(f"Error al inicializar el cliente de la API: {e}")
 
-    def _execute_api_call(self, api_call_function):
-        """
-        Función interna que envuelve cualquier llamada a la API con la lógica de reintentos.
-        """
-        delay = self.initial_delay
-        for attempt in range(self.max_retries):
-            try:
-                # Intenta ejecutar la función que se le pasa (ej. fetch_balance)
-                return api_call_function()
-            except ccxt.NetworkError as e:
-                log.warning(f"Error de red en el intento {attempt + 1}/{self.max_retries}: {e}. Reintentando en {delay}s...")
-            except ccxt.ExchangeError as e:
-                log.warning(f"Error del exchange en el intento {attempt + 1}/{self.max_retries}: {e}. Reintentando en {delay}s...")
-            
-            time.sleep(delay)
-            delay *= 2 # Duplicar el tiempo de espera (retroceso exponencial)
-        
-        log.error(f"La llamada a la API falló después de {self.max_retries} intentos.")
-        return None
-
-    def check_connection(self):
-        """Verifica la conexión usando la lógica de reintentos."""
-        if not self.client: return False
-        log.info("Verificando conexión con la API de Coinbase (vía CCXT)...")
-        
-        # Le pasamos la función fetch_balance a nuestro ejecutor de llamadas
-        response = self._execute_api_call(lambda: self.client.fetch_balance())
-        
-        if response is not None:
-            log.info("Conexión y credenciales verificadas exitosamente.")
-            return True
-        else:
-            log.error("Fallo en la conexión después de varios reintentos.")
-            return False
-
-    def get_historical_data(self, product_id, granularity, limit=300, min_candles=200):
-        """Obtiene datos históricos usando la lógica de reintentos."""
-        if not self.client: return None
-        log.info(f"Obteniendo datos históricos para {product_id}...")
-
-        def api_call():
-            return self.client.fetch_ohlcv(product_id.replace('-', '/'), timeframe=granularity, limit=limit)
-
-        ohlcv = self._execute_api_call(api_call)
-        
-        if ohlcv is None:
-            log.warning(f"No se pudieron obtener los datos para {product_id} después de varios reintentos.")
+    def get_historical_data(self, symbol, timeframe, limit=400):
+        # ... (Esta función no necesita cambios, la dejo por completitud)
+        if not self.exchange or not self.exchange.has['fetchOHLCV']:
+            log.error("El cliente del exchange no está inicializado.")
+            return None
+        try:
+            log.info(f"Obteniendo datos históricos para {symbol} (hasta {limit} velas)...")
+            all_ohlcv = []
+            since = None
+            fetch_limit = 300
+            while len(all_ohlcv) < limit:
+                ohlcv = self.exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=fetch_limit)
+                if not ohlcv: break
+                since = ohlcv[0][0] - 1
+                all_ohlcv = ohlcv + all_ohlcv
+                time.sleep(self.exchange.rateLimit / 1000)
+            df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df = df.tail(limit)
+            log.info(f"Datos históricos para {symbol} obtenidos y procesados ({len(df)} velas).")
+            return df
+        except Exception as e:
+            log.error(f"Error al obtener datos históricos para {symbol}: {e}")
             return None
 
-        if len(ohlcv) < min_candles:
-            log.warning(f"La API devolvió {len(ohlcv)} velas, menos de las {min_candles} requeridas.")
+    def get_balance(self, currency):
+        # ... (Esta función no necesita cambios) ...
+        if not self.exchange:
+            log.error("El cliente del exchange no está inicializado.")
+            return 0.0
+        try:
+            balance = self.exchange.fetch_balance()
+            if currency in balance and 'free' in balance[currency]:
+                return float(balance[currency]['free'])
+            return 0.0
+        except Exception as e:
+            log.error(f"Error al obtener el balance para {currency}: {e}")
             return None
 
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df.set_index('timestamp', inplace=True)
-        df.sort_index(ascending=True, inplace=True)
-        log.info(f"Datos históricos para {product_id} obtenidos y procesados ({len(df)} velas).")
-        return df
-
-# Crear una instancia del cliente para ser importada
 api_client = APIClient()

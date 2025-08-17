@@ -1,120 +1,115 @@
-# main.py
 import time
-import pandas as pd
 import pandas_ta as ta
 from logger import log
 import health_checker
 from config import config
-from api_client import api_client
-from strategy import Strategy
-from risk_manager import RiskManager
+from api_client import APIClient
+import strategy
+import risk_manager
 from state_manager import StateManager
 from notifier import notifier
 from execution_handler import execution_handler
-from portfolio_analyzer import portfolio_analyzer
+from intelligence_analyzer import intelligence_analyzer
+
+def get_latest_solana_news():
+    log.info("Simulando obtención de noticias sobre Solana...")
+    return ["Solana price shows strength as network activity surges."]
 
 def main():
     log.info("==============================================")
-    log.info(f"    INICIANDO BOT (ESTRATEGIA SOLANA OPTIMIZADA) - MODO: {config.BOT_MODE}    ")
+    log.info(f"    INICIANDO BOT - MODO: {config.BOT_MODE}    ")
+    log.info(f"    ESTRATEGIA: Breakout 6H (SOL/USDT)    ")
     log.info("==============================================")
-    notifier.send_message(f"✅ **Bot Iniciado**\nModo: {config.BOT_MODE}\nActivo: SOL/USD\nTemporalidad: 6h")
-
-    if not health_checker.perform_initial_checks(): 
-        notifier.send_message("❌ **Error Crítico**\nEl bot no superó los chequeos de salud y se apagará.")
-        return
-
-    # --- Parámetros Óptimos para Solana ---
-    strategy_params_sol = {'fast': 20, 'slow': 60, 'rsi_period': 21, 'rsi_threshold': 55}
-    risk_params_sol = {'atr_period': 14, 'atr_multiplier': 3.5}
     
-    sol_strategy = Strategy(**strategy_params_sol)
-    # --- CAMBIO 1: Inicializamos el RiskManager con un riesgo por defecto ---
-    risk_manager = RiskManager(default_risk_per_trade=0.02)
+    api_client = APIClient() 
     state_manager = StateManager()
-    total_capital = 10000 
+
+    notifier.send_message(f"✅ **Bot Iniciado**\nModo: {config.BOT_MODE}\nEstrategia: Breakout 6H (SOL)")
+    if not health_checker.perform_initial_checks(api_client):
+        return
     
     while True:
         log.info("***************** INICIANDO NUEVO CICLO DE TRADING *****************")
-        active_trades = state_manager.load_state()
-        log.info(f"Estado actual cargado. Operaciones activas: {len(active_trades)}")
         
-        # --- LÓGICA DE GESTIÓN Y SINCRONIZACIÓN DE POSICIÓN ---
-        if 'SOL' in active_trades and active_trades['SOL']['status'] == 'open':
-            log.info("Posición abierta detectada para SOL. Verificando estado...")
-            trade = active_trades['SOL']
-            order_id = trade['order_details']['id']
-            product_id = trade['order_details']['symbol']
-            
-            order_status = execution_handler.get_order_status(order_id, product_id)
-            
-            if order_status and order_status['status'] == 'closed':
-                log.info(f"Orden {order_id} confirmada como EJECUTADA. La posición está activa.")
-                # Aquí iría la lógica para gestionar el trailing stop-loss.
-                
-            elif order_status and order_status['status'] == 'open':
-                log.info(f"La orden de compra {order_id} todavía está abierta (esperando a ser ejecutada).")
-            elif order_status is None:
-                log.warning(f"No se pudo confirmar el estado de la orden {order_id}. Se reintentará.")
+        try:
+            current_balance = api_client.get_balance('USDT')
+            if current_balance is not None:
+                log.info(f"SALDO ACTUAL EN CUENTA: ${current_balance:,.2f} USDT")
+            else:
+                log.warning("No se pudo obtener el balance actual de la cuenta.")
 
-        # --- LÓGICA DE BÚSQUEDA DE NUEVAS ENTRADAS ---
-        elif 'SOL' not in active_trades:
-            log.info("--- Buscando nueva oportunidad de entrada para Solana (SOL) ---")
+            if state_manager.is_in_position('SOL/USDT'):
+                log.info("Posición abierta detectada para SOL. Monitoreando condiciones de salida.")
+                time.sleep(300)
+                continue
+
+            log.info("Buscando nueva oportunidad de entrada para SOL...")
+            sol_data = api_client.get_historical_data('SOL/USDT', '6h', limit=400)
+            btc_6h_data = api_client.get_historical_data('BTC/USDT', '6h', limit=400)
+            btc_1d_data = api_client.get_historical_data('BTC/USDT', '1d', limit=400)
             
-            sol_data = api_client.get_historical_data(product_id='SOL/USD', granularity='6h', min_candles=201)
-            
-            if sol_data is not None and not sol_data.empty:
-                if not portfolio_analyzer.is_highly_correlated('SOL/USD', sol_data, active_trades):
-                    log.info("Correlación de cartera aceptable. Procediendo con el análisis de la señal...")
-                    sol_data.ta.atr(append=True, length=risk_params_sol['atr_period'])
-                    sol_signal = sol_strategy.analyze_sol_combined(sol_data)
-                    log.info(f"Señal de la estrategia SOL: {sol_signal}")
-                    
-                    if sol_signal == 'BUY':
-                        latest_data = sol_data.iloc[-1]
+            if sol_data is not None and not sol_data.empty and btc_6h_data is not None and btc_1d_data is not None:
+                signal = strategy.check_strategy_6h_breakout(sol_data, btc_6h_data, btc_1d_data, config)
+                log.info(f"Señal de la estrategia cuantitativa: {signal}")
+                
+                if signal in ['long', 'short']:
+                    if signal == 'long':
+                        log.info("Señal de compra recibida. Consultando filtro de IA...")
+                        headlines = get_latest_solana_news()
+                        sentiment = intelligence_analyzer.get_news_sentiment(headlines)
                         
-                        # --- CAMBIO 2: Lógica de Riesgo Dinámico ---
-                        avg_atr_percent = (latest_data['ATRr_14'] / latest_data['close']) * 100
+                        if sentiment == 'NEGATIVE':
+                            log.warning("OPERACIÓN VETADA POR IA.")
+                            time.sleep(300)
+                            continue
                         
-                        if avg_atr_percent < 4: # Volatilidad baja -> Alta confianza
-                            risk_for_this_trade = 0.03 # Arriesgar 3%
-                            log.info(f"Volatilidad baja detectada ({avg_atr_percent:.2f}%). Aumentando riesgo a 3%.")
-                        elif avg_atr_percent > 7: # Volatilidad alta -> Baja confianza
-                            risk_for_this_trade = 0.01 # Arriesgar 1%
-                            log.info(f"Volatilidad alta detectada ({avg_atr_percent:.2f}%). Reduciendo riesgo a 1%.")
-                        else: # Volatilidad normal
-                            risk_for_this_trade = risk_manager.default_risk
-                        # --- FIN DE LA LÓGICA DE RIESGO DINÁMICO ---
+                        log.info(f"Sentimiento de mercado '{sentiment}'. APROBANDO operación.")
+
+                    if current_balance is not None and current_balance > 0:
+                        current_price = sol_data['close'].iloc[-1]
+                        atr = ta.atr(sol_data['high'], sol_data['low'], sol_data['close'], length=14).iloc[-1]
                         
-                        entry_price = latest_data['close']
-                        atr_col_name = f'ATRr_{risk_params_sol["atr_period"]}'
-                        stop_loss_price = entry_price - (latest_data[atr_col_name] * risk_params_sol['atr_multiplier'])
-                        
-                        position_size = risk_manager.calculate_position_size(
-                            total_capital, entry_price, stop_loss_price, risk_for_this_trade
+                        position_size, sl_long, sl_short = risk_manager.calculate_position_details(
+                            price=current_price,
+                            balance=current_balance,
+                            risk_pct=config.STRATEGY_CONFIG['risk_pct'],
+                            atr=atr,
+                            atr_stop_mult=config.STRATEGY_CONFIG['atr_stop_mult']
                         )
                         
-                        if position_size is not None:
-                            amount_of_asset = position_size / entry_price
-                            limit_price = entry_price * 0.995
-                            order_result = execution_handler.place_limit_order(
-                                product_id='SOL/USD', 
-                                side='buy', 
-                                price=limit_price, 
-                                amount_of_asset=amount_of_asset
-                            )
+                        stop_loss_price = sl_long if signal == 'long' else sl_short
+                        
+                        if position_size > 0:
+                            log.info(f"Ejecutando orden {signal.upper()} para {position_size:.4f} SOL a ${current_price:.2f}")
                             
-                            if order_result:
-                                log.info(f"Orden Límite para SOL colocada. ID: {order_result['id']}")
-                                active_trades['SOL'] = { "order_details": order_result, "stop_loss_price": stop_loss_price, "status": "open" }
-                                state_manager.save_state(active_trades)
+                            log.warning("LA EJECUCIÓN DE ÓRDENES ESTÁ DESACTIVADA. Esta es una prueba en seco.")
+                            # order_result = execution_handler.place_market_order_with_sl(...)
                 else:
-                    log.warning("No se pudieron obtener los datos suficientes para SOL o hubo un error en la API.")
-
-        # Pausa de 6 horas
-        sleep_duration_seconds = 6 * 60 * 60
-        log.info(f"Ciclo finalizado. Durmiendo durante {sleep_duration_seconds / 3600:.1f} horas...")
-        log.info("==============================================")
-        time.sleep(sleep_duration_seconds)
+                    # --- MEJORA 2: Notificación de "Sigo Vivo" en Telegram ---
+                    log.info("No hay señal. Enviando notificación de estado.")
+                    notifier.send_message("✅ Ciclo completado sin señal. El bot sigue activo y monitoreando.")
+            
+            # --- MEJORA 1: Temporizador Visual en la Consola ---
+            total_sleep_seconds = 6 * 60 * 60
+            sleep_interval_seconds = 15 * 60 # Intervalo de 15 minutos
+            
+            log.info("Ciclo finalizado. Entrando en modo de espera de 6 horas...")
+            num_intervals = total_sleep_seconds // sleep_interval_seconds
+            
+            for i in range(num_intervals):
+                remaining_seconds = total_sleep_seconds - ((i + 1) * sleep_interval_seconds)
+                # Convertir segundos a horas y minutos para el log
+                hours, remainder = divmod(remaining_seconds, 3600)
+                minutes, _ = divmod(remainder, 60)
+                # Usamos print() con '\r' para una línea que se actualiza sola en la consola
+                print(f"  Próximo ciclo de análisis en {int(hours)}h {int(minutes)}m...          \r", end="")
+                time.sleep(sleep_interval_seconds)
+            print("\n") # Nueva línea para limpiar el contador
+        
+        except Exception as e:
+            log.error(f"Ocurrió un error en el bucle principal: {e}", exc_info=True)
+            notifier.send_message(f"🚨 **Error Crítico en el Bot**\nError: {e}")
+            time.sleep(60)
 
 if __name__ == "__main__":
     main()

@@ -1,51 +1,88 @@
 # ml_training/download_binance_data.py
+
 import ccxt
 import pandas as pd
-import time
+import os
+from datetime import datetime
 
-def download_full_history(product_id='BTC/USDT', granularity='4h', years=3):
+# --- Configuración ---
+exchange_id = 'binanceus' # Usamos Binance.US como se definió en la arquitectura
+symbol_to_timeframes = {
+    'SOL/USDT': ['6h'],
+    'BTC/USDT': ['6h', '1d']
+}
+# Fecha de inicio para descargar los datos (formato: YYYY-MM-DD)
+# Usamos una fecha lejana para obtener un historial amplio para el backtest
+since_date = '2020-01-01T00:00:00Z'
+
+output_dir = 'data' # Carpeta donde se guardarán los datos
+
+# --- Inicialización del Exchange ---
+exchange = getattr(ccxt, exchange_id)()
+
+# --- Lógica de Descarga ---
+
+def download_ohlcv(symbol, timeframe, since):
     """
-    Descarga un historial completo de datos desde Binance.US.
+    Descarga los datos OHLCV de un símbolo y temporalidad específicos.
     """
-    print(f"Iniciando la descarga de {years} años de datos para {product_id} [{granularity}] desde Binance.US...")
-
-    # --- CORRECCIÓN CLAVE: Conectar a binanceus en lugar de binance ---
-    exchange = ccxt.binanceus()
-
-    timeframe_in_ms = exchange.parse_timeframe(granularity) * 1000
-    now = exchange.milliseconds()
-    since = now - (years * 365 * 24 * 60 * 60 * 1000)
+    print(f"Iniciando descarga para {symbol} en temporalidad {timeframe}...")
     
-    all_candles = []
-
-    while since < now:
+    since_timestamp = exchange.parse8601(since)
+    all_ohlcv = []
+    
+    while True:
         try:
-            print(f"Descargando lote de datos desde {pd.to_datetime(since, unit='ms')}...")
-            candles = exchange.fetch_ohlcv(product_id, timeframe=granularity, since=since, limit=1000)
+            # Descargamos los datos en lotes (Binance permite hasta 1000 velas por llamada)
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since=since_timestamp, limit=1000)
+            if len(ohlcv) == 0:
+                break # No hay más datos disponibles
             
-            if len(candles):
-                all_candles.extend(candles)
-                since = candles[-1][0] + timeframe_in_ms
-            else:
-                break
-
-            time.sleep(exchange.rateLimit / 1000)
+            all_ohlcv.extend(ohlcv)
+            since_timestamp = ohlcv[-1][0] + 1 # Actualizamos el timestamp para la siguiente llamada
+            
+            # Imprimimos el progreso
+            last_date = datetime.fromtimestamp(ohlcv[-1][0] / 1000)
+            print(f"  Datos obtenidos hasta: {last_date.strftime('%Y-%m-%d %H:%M:%S')}")
 
         except Exception as e:
-            print(f"Ocurrió un error: {e}. Reintentando en 30 segundos...")
-            time.sleep(30)
+            print(f"Ocurrió un error descargando {symbol} ({timeframe}): {e}")
+            break
+            
+    return all_ohlcv
+
+def save_to_csv(symbol, timeframe, ohlcv_data):
+    """
+    Guarda los datos OHLCV en un archivo CSV.
+    """
+    if not ohlcv_data:
+        print(f"No hay datos para guardar para {symbol} en {timeframe}.")
+        return
+
+    # Creamos el directorio si no existe
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    # Convertimos a DataFrame de Pandas
+    df = pd.DataFrame(ohlcv_data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
     
-    print(f"\n✅ Descarga completa. Total de velas obtenidas: {len(all_candles)}")
+    # Formateamos el nombre del archivo
+    safe_symbol = symbol.replace('/', '_')
+    filename = f"{safe_symbol}_{timeframe}.csv"
+    filepath = os.path.join(output_dir, filename)
+    
+    # Guardamos el archivo
+    df.to_csv(filepath, index=False)
+    print(f"Datos guardados exitosamente en: {filepath}")
+    print("-" * 30)
 
-    df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df.set_index('timestamp', inplace=True)
-    df = df[~df.index.duplicated(keep='first')]
+# --- Bucle Principal ---
 
-    output_file = f"{product_id.replace('/', '_')}_{granularity}_data.csv"
-    df.to_csv(output_file)
-    print(f"Datos guardados exitosamente en '{output_file}'")
-
-if __name__ == "__main__":
-    # Cambia el par y la granularidad para descargar los datos de Solana
-    download_full_history(product_id='SOL/USDT', granularity='4h', years=3)
+if __name__ == '__main__':
+    for symbol, timeframes in symbol_to_timeframes.items():
+        for tf in timeframes:
+            data = download_ohlcv(symbol, tf, since_date)
+            save_to_csv(symbol, tf, data)
+    
+    print("Descarga de todos los datos completada.")

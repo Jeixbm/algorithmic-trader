@@ -1,75 +1,72 @@
-# trading_bot/strategy.py
 import pandas as pd
 import pandas_ta as ta
+import numpy as np
+from logger import log # Importar el logger para el warning
 
-class Strategy:
-    """
-    Versión 6: Contiene múltiples estrategias para múltiples activos.
-    """
-    def __init__(self, **params):
-        """
-        Inicializa la estrategia con un diccionario de parámetros flexible.
-        """
-        # Asignar parámetros dinámicamente
-        self.params = params
-        # No ponemos logs para no saturar la consola en pruebas masivas
+def check_strategy_6h_breakout(sol_df, btc_6h_df, btc_1d_df, config_obj):
+    params = config_obj.STRATEGY_CONFIG
+    
+    sol_df['datetime'] = pd.to_datetime(sol_df['datetime'])
+    sol_df.set_index('datetime', inplace=True)
+    
+    btc_6h_df['datetime'] = pd.to_datetime(btc_6h_df['datetime'])
+    btc_6h_df.set_index('datetime', inplace=True)
+    
+    btc_1d_df['datetime'] = pd.to_datetime(btc_1d_df['datetime'])
+    btc_1d_df.set_index('datetime', inplace=True)
 
-    def analyze_btc_trend_rider(self, data):
-        """Estrategia de Cruce de EMAs para BTC."""
-        fast_period = self.params.get('fast', 20)
-        slow_period = self.params.get('slow', 50)
-        trend_period = self.params.get('trend', 200)
+    btc_6h_df = btc_6h_df.add_suffix('_btc_6h')
+    btc_1d_df = btc_1d_df.add_suffix('_btc_1d')
 
-        ema_fast = data.ta.ema(length=fast_period)
-        ema_slow = data.ta.ema(length=slow_period)
-        ema_trend = data.ta.ema(length=trend_period)
+    df = sol_df.join(btc_6h_df, how='inner')
+    df = pd.merge_asof(
+        df.sort_index(), 
+        btc_1d_df.sort_index(),
+        left_index=True,
+        right_index=True,
+        direction='backward'
+    )
+    
+    df.ta.ema(length=params['ema_fast_len'], append=True, col_names=('EMA_fast'))
+    df.ta.ema(length=params['ema_slow_len'], append=True, col_names=('EMA_slow'))
+    df.ta.adx(length=params['adx_len'], append=True, col_names=('ADX', 'DMP', 'DMN'))
+    
+    donchian = ta.donchian(high=df['high'], low=df['low'], length=params['don_len'])
+    df['DON_upper'] = donchian[f'DCU_{params["don_len"]}_{params["don_len"]}']
+    df['DON_lower'] = donchian[f'DCL_{params["don_len"]}_{params["don_len"]}']
+    
+    keltner = ta.kc(high=df['high'], low=df['low'], close=df['close'], length=params['kc_len'], scalar=params['kc_mult'])
+    df['KC_upper'] = keltner[f'KCUe_{params["kc_len"]}_{params["kc_mult"]}']
+    df['KC_lower'] = keltner[f'KCLe_{params["kc_len"]}_{params["kc_mult"]}']
+    
+    df['btc_EMA_slow_6h'] = ta.ema(df['close_btc_6h'], length=params['ema_slow_len'])
+    df['btc_EMA_slow_1d'] = ta.ema(df['close_btc_1d'], length=200)
 
-        if ema_fast is None or ema_slow is None or ema_trend is None: return 'HOLD'
-            
-        ema_diff = ema_fast - ema_slow
+    latest = df.iloc[-1]
+    previous = df.iloc[-2]
+
+    required_cols = ['close_btc_6h', 'btc_EMA_slow_6h', 'close_btc_1d', 'btc_EMA_slow_1d', 'EMA_slow', 'EMA_fast', 'ADX', 'DON_upper', 'DON_lower', 'KC_upper', 'KC_lower']
+    
+    # --- CORRECCIÓN: Usar pd.isna() en lugar de np.isnan() ---
+    if any(pd.isna(latest[col]) for col in required_cols):
+        log.warning("Datos insuficientes para calcular todos los indicadores. Omitiendo ciclo.")
+        return None
+
+    btc_up = (latest['close_btc_6h'] > latest['btc_EMA_slow_6h']) and (latest['close_btc_1d'] > latest['btc_EMA_slow_1d'])
+    btc_down = (latest['close_btc_6h'] < latest['btc_EMA_slow_6h']) and (latest['close_btc_1d'] < latest['btc_EMA_slow_1d'])
+    
+    up_trend = (latest['close'] > latest['EMA_slow']) and (latest['EMA_fast'] > latest['EMA_slow'])
+    down_trend = (latest['close'] < latest['EMA_slow']) and (latest['EMA_fast'] < latest['EMA_slow'])
+    
+    anti_chop = latest['ADX'] >= params['adx_min']
+    
+    long_break = up_trend and anti_chop and (latest['close'] > previous['DON_upper']) and (latest['close'] > latest['KC_upper'])
+    short_break = down_trend and anti_chop and (latest['close'] < previous['DON_lower']) and (latest['close'] < previous['KC_lower'])
+    
+    if long_break and btc_up:
+        return 'long'
+    
+    if short_break and btc_down:
+        return 'short'
         
-        latest_close = data['close'].iloc[-1]
-        latest_trend_ema = ema_trend.iloc[-1]
-        latest_diff = ema_diff.iloc[-1]
-        previous_diff = ema_diff.iloc[-2]
-
-        is_uptrend = latest_close > latest_trend_ema
-        buy_signal = previous_diff <= 0 and latest_diff > 0
-        sell_signal = previous_diff >= 0 and latest_diff < 0
-
-        if is_uptrend and buy_signal: return 'BUY'
-        if sell_signal: return 'SELL'
-        return 'HOLD'
-        
-    def analyze_sol_combined(self, data):
-        """
-        Nueva estrategia para SOL: Cruce de EMAs + Filtro de Momentum RSI.
-        """
-        fast_period = self.params.get('fast', 20)
-        slow_period = self.params.get('slow', 50)
-        rsi_period = self.params.get('rsi_period', 14)
-        rsi_threshold = self.params.get('rsi_threshold', 50)
-
-        # Calcular indicadores
-        ema_fast = data.ta.ema(length=fast_period)
-        ema_slow = data.ta.ema(length=slow_period)
-        rsi = data.ta.rsi(length=rsi_period)
-
-        if ema_fast is None or ema_slow is None or rsi is None: return 'HOLD'
-            
-        # Lógica de Cruce
-        ema_diff = ema_fast - ema_slow
-        latest_diff = ema_diff.iloc[-1]
-        previous_diff = ema_diff.iloc[-2]
-        
-        # Lógica de RSI
-        latest_rsi = rsi.iloc[-1]
-        
-        # Condiciones
-        buy_crossover = previous_diff <= 0 and latest_diff > 0
-        sell_crossover = previous_diff >= 0 and latest_diff < 0
-        momentum_confirmed = latest_rsi > rsi_threshold
-
-        if buy_crossover and momentum_confirmed: return 'BUY'
-        if sell_crossover: return 'SELL'
-        return 'HOLD'
+    return None

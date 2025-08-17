@@ -1,45 +1,55 @@
-# trading_bot/notifier.py
 import telegram
 import asyncio
-from config import config
 from logger import log
+from config import config
 
 class Notifier:
     def __init__(self):
-        self.bot_token = config.TELEGRAM_TOKEN
+        self.token = config.TELEGRAM_TOKEN
         self.chat_id = config.TELEGRAM_CHAT_ID
-        self.bot = None
-
-        if self.bot_token and self.chat_id:
-            try:
-                self.bot = telegram.Bot(token=self.bot_token)
-                log.info("Módulo de Notificaciones (Telegram) inicializado correctamente.")
-            except Exception as e:
-                log.error(f"Error al inicializar el bot de Telegram: {e}")
+        
+        if self.token and self.chat_id:
+            log.info("Módulo de Notificaciones (Telegram) inicializado correctamente.")
         else:
-            log.warning("Credenciales de Telegram no encontradas. Las notificaciones estarán desactivadas.")
+            log.warning("Credenciales de Telegram no encontradas. El notificador está desactivado.")
+
+    async def _send_async(self, message):
+        """
+        Función asíncrona interna para enviar el mensaje.
+        """
+        try:
+            bot = telegram.Bot(token=self.token)
+            await bot.send_message(
+                chat_id=self.chat_id,
+                text=message,
+                parse_mode='Markdown'
+            )
+            log.info("Notificación enviada por Telegram.")
+        except Exception as e:
+            log.error(f"Error al enviar la notificación asíncrona por Telegram: {e}")
 
     def send_message(self, message):
         """
-        Envía un mensaje a través de Telegram de forma asíncrona.
+        Función síncrona que el bot puede llamar de forma segura.
+        Crea un nuevo ciclo de conexión para cada mensaje.
         """
-        if not self.bot:
-            log.warning(f"Intento de enviar notificación, pero el bot de Telegram no está configurado: '{message}'")
+        if not self.token or not self.chat_id:
             return
 
-        async def send():
-            try:
-                await self.bot.send_message(chat_id=self.chat_id, text=message, parse_mode='Markdown')
-                log.info("Notificación enviada por Telegram.")
-            except Exception as e:
-                log.error(f"Error al enviar la notificación por Telegram: {e}")
-
-        # Ejecutar la función asíncrona desde nuestro código síncrono
         try:
-            asyncio.run(send())
-        except RuntimeError: # En caso de que ya haya un bucle de eventos corriendo
-            loop = asyncio.get_event_loop()
-            loop.create_task(send())
+            # Esta es la magia: asyncio.run() crea un nuevo "hilo" de comunicación
+            # para cada mensaje, evitando problemas con conexiones cerradas.
+            asyncio.run(self._send_async(message))
+        except RuntimeError as e:
+            # Maneja un caso raro donde un bucle ya podría estar corriendo
+            if "cannot run loop while another loop is running" in str(e):
+                # Si ya hay un bucle, simplemente lo usamos
+                loop = asyncio.get_event_loop()
+                loop.create_task(self._send_async(message))
+            else:
+                log.error(f"Error de Runtime en el notificador: {e}")
+        except Exception as e:
+            log.error(f"Error general en el notificador: {e}")
 
-# Crear una instancia para ser usada por otros módulos
+# Crear una instancia global para ser usada por el bot
 notifier = Notifier()
